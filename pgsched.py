@@ -30,16 +30,16 @@ class Task:
 		self.db = None
 	
 	def cb_finished(self, cur, req):
-		self.done()
+		self.done(cur.fetchone()[0])
 
 	def cb_failed(self, cur, req, err):
-		self.done(False)
+		self.done(-10)
 
-	def done(self, success = True):
-		if success:
+	def done(self, success):
+		if success >= 0:
 			ss = 'SUCCESS'
 		else:
-			ss = 'FAILURE'
+			ss = 'FAILURE (code: %d)' % success
 		logging.debug("Finished %s task %d: %s" % (self.type, self.id, ss))
 		self.db.stop()
 		self.db = None
