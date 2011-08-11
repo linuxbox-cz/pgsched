@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 # -*- encoding: utf8 -*-
 
+# XXX: DEBUG
+from os import environ
+environ['LOG_LEVEL'] = 'debug'
+
 import lbasync
-import psycopg2, psycopg2.extensions
 import re, sys, os, time, logging, getopt
-from logging.handlers import SysLogHandler
-from logging import StreamHandler
-from daemon import Daemon
+import psycopg2, psycopg2.extensions
+import logging
 from pgasync import PGasync
 from copy import copy
 from exceptions import Exception
@@ -18,8 +20,6 @@ SCHEMA = 'pgscheduler'
 DEBUG = True
 DAEMON = False
 MAX_CONN = 5
-
-logger = logging.getLogger()
 
 
 TS_WAITING, TS_RUNNING, TS_DONE = range(3)
@@ -40,14 +40,13 @@ class Task:
 			ss = 'SUCCESS'
 		else:
 			ss = 'FAILURE'
-		logger.debug("Finished %s task %d: %s" % (self.type, self.id, ss))
+		logging.debug("Finished %s task %d: %s" % (self.type, self.id, ss))
 		self.db.stop()
-		self.db.close()
 		self.db = None
 		self.finished_cb(self, success)
 
 	def run(self):
-		logger.debug("RUN %s" % self)
+		logging.debug("RUN %s" % self)
 		self.db = PGasync('')
 		self.db.execute('SELECT "%s".run_task(\'%s\', %d);' % (SCHEMA, self.type, self.id), None, self.cb_finished, self.cb_failed)
 	
@@ -62,7 +61,7 @@ class PgSched:
 		self.nt_timer = None
 	
 	def run_task(self, task):
-		logger.debug('.run_next_task()')
+		logging.debug('.run_next_task()')
 		self.tasks.append(task)
 		task.run()
 	
@@ -70,21 +69,21 @@ class PgSched:
 		self.tasks.remove(task)
 
 	def cb_got_next_task(self, cur, req):
-		logger.debug('.cb_got_next_task()')
+		logging.debug('.cb_got_next_task()')
 		row = cur.fetchone()
 		wait = row[0]
 		if wait == None:
-			logger.debug("No more tasks. Waiting.")
-			self.get_next_task_in(10)
+			logging.debug("No more tasks. Waiting.")
+			self.get_next_task_in(5)
 		elif wait > 0:
-			logger.debug("Waiting %g s for next task." % wait)
+			logging.debug("Waiting %g s for next task." % wait)
 			self.get_next_task_in(wait)
 		else:
 			self.run_task(Task(row, self.cb_task_finished))
 			self.get_next_task()
 
 	def cb_err_next_task(self, cur, req, err):
-		logger.error("Error retrieving next task: %s" % err)
+		logging.error("Error retrieving next task: %s" % err)
 		self.get_next_task_in(1)
 
 	def has_max_conn(self):
@@ -93,45 +92,39 @@ class PgSched:
 
 	# always call this through get_next_task_in()
 	def get_next_task(self, timer = None):
-		logger.debug('.get_next_task()')
+		logging.debug('.get_next_task()')
 		if timer != None:
 			if timer == self.nt_timer:
 				self.nt_timer = None
 			else:
 				# TODO: temporary bug catcher - remove & shrink this shit to one line
-				logger.warning('BUG: More than one next_task timer active.')
+				logging.warning('BUG: More than one next_task timer active.')
 		if self.has_max_conn():
-			logger.debug("Too many connections. Waiting.")
+			logging.debug("Too many connections. Waiting.")
 			self.get_next_task_in(1)
 		else:
 			self.db.execute('SELECT * FROM "%s".next_task();' % SCHEMA, None, self.cb_got_next_task, self.cb_err_next_task)
 	
 	def get_next_task_in(self, time):
 		if self.nt_timer:
-			logger.debug("Replacing next_task timer.")
-			lbasync.stopTimer(self.nt_timer)
+			logging.debug("Replacing next_task timer.")
+			lbasync.stop_timer(self.nt_timer)
 		if time <= 0:
 			self.nt_timer = None
 			self.get_next_task()
 		else:
-			self.nt_timer = lbasync.setTimer(self.get_next_task, time)
+			self.nt_timer = lbasync.set_timer(self.get_next_task, time)
 	
 	def cb_notify(self, notify, client):
-		logger.debug('NOTIFY received.')
+		logging.debug('NOTIFY received.')
 		self.get_next_task_in(0)
 	
 	def run(self):
 		self.db = PGasync('')
 		self.db.listen('pgs_tasks_change', self.cb_notify)
-		self.get_next_task()
+		self.get_next_task_in(0)
 		print "---- lbasync.run() ----"
 		lbasync.run()
-
-class PgSchedDaemon(Daemon):
-	def run(self):
-		global DAEMON
-		DAEMON = True
-		pgs_main()
 
 #### script functions
 
@@ -158,6 +151,7 @@ def load_args():
 	for o, a in opts:
 		if o in ('-d', '--daemon'):
 			DAEMON = True
+			# TODO: this does nothing now, use lbasync `export DAEMON` mechanism
 		elif o in ('-h', '--help'):
 			usage()
 			sys.exit()
@@ -165,39 +159,14 @@ def load_args():
 			print("pgscheduler version %s" % VERSION)
 			sys.exit()
 
-def setup_logging():
-	global DEBUG, DAEMON, LOG_LEVEL, logger
-	if DEBUG:
-		LOG_LEVEL = logging.DEBUG
-	else:
-		LOG_LEVEL = logging.INFO
-	if DAEMON:
-		handler = SysLogHandler(address='/dev/log')
-		formatter = logging.Formatter('%(name)s: %(levelname)s: %(message)s')
-	else:
-		handler = StreamHandler(sys.stdout)
-		formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
-	logger = logging.getLogger('pgscheduler')
-	logger.setLevel(LOG_LEVEL)
-	handler.setFormatter(formatter)
-	logger.addHandler(handler)
-
-def pgs_main():
-	setup_logging()
+def main(daemon = False):
+	load_args()
 	try:
 		pgsched = PgSched()
 		pgsched.run()
 	except Exception, e:
-		logger.exception("Unexpected error: " + str(e))
+		logging.exception("Unexpected error: " + str(e))
 		sys.exit(1)
-
-def main(daemon = False):
-	load_args()
-	if DAEMON:
-		daemon = PgSchedDaemon(PIDFILE)
-		daemon.start()
-	else:
-		pgs_main()
 
 if __name__ == "__main__":
 	main()

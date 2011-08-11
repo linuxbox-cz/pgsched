@@ -3,20 +3,22 @@ GRANT ALL ON SCHEMA pgscheduler TO pgscheduler;
 SET ROLE pgscheduler;
 SET search_path TO pgscheduler;
 
-CREATE OR REPLACE FUNCTION notify_pgs_tasks_change() RETURNS trigger AS $$
+
+CREATE OR REPLACE FUNCTION tasks_change() RETURNS trigger AS $$
     BEGIN
         NOTIFY pgs_tasks_change;
-        RETURN NULL;
+		RETURN NULL;
     END;
 $$ LANGUAGE plpgsql;
 
 /*
- * Let "task" be a (a series of?) job scheduled to run at a specific time.
+ * Let "task" be a (a series of?) "job" scheduled to run at a specific time.
  * This table has common columns for all the scheduling methods (tables).
  */
 CREATE TABLE pgs_task (
     id          SERIAL PRIMARY KEY,
-    job         TEXT NOT NULL, /* function name or a reference to jobs table? */
+	/* function name to call (without parenthesis) */
+    job         TEXT NOT NULL,
     created     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_run    TIMESTAMPTZ,
     "desc"      TEXT,
@@ -54,16 +56,22 @@ INHERITS (pgs_task);
 
 DROP TRIGGER IF EXISTS pgs_at_change_tr ON pgs_at;
 CREATE TRIGGER pgs_at_change_tr
-AFTER INSERT OR UPDATE OR DELETE ON pgs_at
-    EXECUTE PROCEDURE notify_pgs_tasks_change();
+AFTER INSERT OR UPDATE ON pgs_at
+    EXECUTE PROCEDURE tasks_change();
 
 /*
  * Periodic job runner.
  */
 CREATE TABLE pgs_runner (
 	/* how long after the task finished shall we run it again? */
-    period timestamp NOT NULL
+    period interval  NOT NULL,
+    last_finished    TIMESTAMPTZ
 ) 
 INHERITS (pgs_task);
+
+DROP TRIGGER IF EXISTS pgs_runner_change_tr ON pgs_runner;
+CREATE TRIGGER pgs_runner_change_tr
+AFTER INSERT OR UPDATE ON pgs_runner
+    EXECUTE PROCEDURE tasks_change();
 
 RESET ROLE;
