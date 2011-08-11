@@ -1,0 +1,106 @@
+#!/bin/sh
+# pgsched    This is the init script for PG scheduler  daemon.
+#
+# chkconfig: - 65 35
+# description: PG scheduler daemon.
+# processname: pgsched.py
+# pidfile: /var/run/pgsched.pid
+
+# Source function library.
+INITD=/etc/rc.d/init.d
+. $INITD/functions
+
+
+NAME=`basename $0`
+CMD=/usr/libexec/${NAME}/${NAME}.py
+PID_FILE=/var/run/${NAME}.py.pid
+export LOG_FILE=/var/log/lbox/${NAME}.log
+export DAEMON=1
+
+[ -f /etc/sysconfig/${NAME} ] && . /etc/sysconfig/${NAME}
+
+
+script_result=0
+
+start(){
+	STR=$"Starting $NAME service: "
+	echo -n "$STR"
+
+	if [ -f $PID_FILE ]; then
+		if [ -d /proc/`cat $PID_FILE` ]; then
+			# already running
+			echo -n $"$NAME is already running. "
+			failure "$STR"
+			echo
+			script_result=1
+			return 1
+		else
+			# we were not shut down correctly
+			rm -f "$PID_FILE"
+		fi
+	fi
+
+	DAEMON=1
+	export DAEMON
+	$CMD
+	ret=$? 
+	if [ $ret -eq 0 ]
+	then
+		success "$STR"
+	else
+		failure "$STR"
+		script_result=1
+	fi
+	echo
+}
+
+stop() {
+	STR=$"Stoping $NAME service: "
+	echo -n "$STR"
+
+	if [ -s $PID_FILE ]; then
+		PID=`cat "$PID_FILE"`
+		kill $PID >/dev/null 2>&1
+
+		if [ -d /proc/$PID ]; then
+			echo -n "kill failed (try -9 maybe?)"
+			failure "$STR"
+		else
+			rm -f "$PID_FILE"
+			success "$STR"
+			echo
+		fi
+	else
+		echo -n "no pidfile (not running?)"
+		failure "$STR"
+		echo
+	fi	
+}
+
+restart(){
+    stop
+    start
+}
+
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  restart)
+	restart
+	;;
+  status)
+	status -p "$PID_FILE"
+	script_result=$?
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart|status}"
+	exit 1
+esac
+
+exit $script_result

@@ -1,6 +1,6 @@
 --
--- BEWARE: requires hstore from postgresql-contrib installed into public
---         pgsched role must be prepared
+-- BEWARE: Requires hstore from postgresql-contrib installed into public.
+--         pgsched superuser role must be prepared.
 --
 CREATE SCHEMA pgsched;
 GRANT ALL ON SCHEMA pgsched TO pgsched;
@@ -99,7 +99,8 @@ CREATE TABLE pgs_task (
     valid_to    TIMESTAMPTZ,
 	log_level   INTEGER NOT NULL DEFAULT 1
 );
-COMMENT ON COLUMN pgs_task.job IS 'Name of function to call without ().';
+COMMENT ON COLUMN pgs_task.job IS 'Name of function to call.';
+COMMENT ON COLUMN pgs_task.role IS 'Run job as this role.';
 COMMENT ON COLUMN pgs_task.log_level IS '0 - log nothing, 1 - log fails only, 2 - log errors, runs & finishes';
 
 /*
@@ -117,6 +118,9 @@ CREATE TABLE pgs_cron (
     c_dow boolean[] NOT NULL DEFAULT '{f,f,f,f,f,f,f}'::boolean[]
 ) 
 INHERITS (pgs_task);
+COMMENT ON COLUMN pgs_cron.job IS 'Name of function to call.';
+COMMENT ON COLUMN pgs_cron.role IS 'Run job as this role.';
+COMMENT ON COLUMN pgs_cron.log_level IS '0 - log nothing, 1 - log fails only, 2 - log errors, runs & finishes';
 COMMENT ON COLUMN pgs_cron.crontime IS 'Cron time as seen in `man 5 crontab` (ranges, steps, names and specials are supported). c_* columns are internal, ignore them.';
 COMMENT ON COLUMN pgs_cron.retroactive IS 'Run retroactively like anacron?.';
 
@@ -170,6 +174,10 @@ CREATE TABLE pgs_at (
     retroactive boolean DEFAULT false NOT NULL
 ) 
 INHERITS (pgs_task);
+COMMENT ON COLUMN pgs_at.job IS 'Name of function to call.';
+COMMENT ON COLUMN pgs_at.role IS 'Run job as this role.';
+COMMENT ON COLUMN pgs_at.log_level IS '0 - log nothing, 1 - log fails only, 2 - log errors, runs & finishes';
+COMMENT ON COLUMN pgs_at.run_at IS 'Run job at this exact time.';
 COMMENT ON COLUMN pgs_at.retroactive IS 'Run retroactively? (when daemon was down at the time etc.)';
 
 DROP TRIGGER IF EXISTS pgs_at_change_tr ON pgs_at;
@@ -186,6 +194,9 @@ CREATE TABLE pgs_runner (
     last_finished    TIMESTAMPTZ
 ) 
 INHERITS (pgs_task);
+COMMENT ON COLUMN pgs_runner.job IS 'Name of function to call.';
+COMMENT ON COLUMN pgs_runner.role IS 'Run job as this role.';
+COMMENT ON COLUMN pgs_runner.log_level IS '0 - log nothing, 1 - log fails only, 2 - log errors, runs & finishes';
 COMMENT ON COLUMN pgs_runner.period IS 'How long after the task finished shall we run it again?';
 
 DROP TRIGGER IF EXISTS pgs_runner_change_tr ON pgs_runner;
