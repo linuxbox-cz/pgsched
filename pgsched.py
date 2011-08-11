@@ -15,18 +15,20 @@ from exceptions import Exception
 
 
 VERSION = '0.1'
-PIDFILE = '/var/run/pgscheduler.pid'
-SCHEMA = 'pgscheduler'
+PIDFILE = '/var/run/pgsched.pid'
+SCHEMA = 'pgsched'
 DEBUG = True
 DAEMON = False
 MAX_CONN = 5
+CHECK_PERIOD = 30
 
 
 TS_WAITING, TS_RUNNING, TS_DONE = range(3)
 class Task:
-	def __init__(self, task_row, finished_callback):
+	def __init__(self, dbname, task_row, finished_callback):
 		_, self.type, self.id, self.job, self.role, self.t_run, self.retro = task_row
 		self.finished_cb = finished_callback
+		self.dbname = dbname
 		self.db = None
 	
 	def cb_finished(self, cur, req):
@@ -40,28 +42,29 @@ class Task:
 			ss = 'SUCCESS'
 		else:
 			ss = 'FAILURE (code: %d)' % success
-		logging.debug("Finished %s task %d: %s" % (self.type, self.id, ss))
+		logging.debug("[%s] Finished %s task %d: %s" % (self.dbname, self.type, self.id, ss))
 		self.db.stop()
 		self.db = None
 		self.finished_cb(self, success)
 
 	def run(self):
 		logging.debug("RUN %s" % self)
-		self.db = PGasync('')
+		environ['PGDATABASE'] = self.dbname
+		self.db = PGasync()
 		self.db.execute('SELECT "%s".run_task(\'%s\', %d);' % (SCHEMA, self.type, self.id), None, self.cb_finished, self.cb_failed)
 	
 	def __str__(self):
-		return "%s task %s, job %s with role %s." % (self.type, self.id, self.job, self.role)
+		return "[%s] %s task %s, job %s with role %s." % (self.dbname, self.type, self.id, self.job, self.role)
 
 
 class PgSched:
 	def __init__(self):
 		self.tasks = []
+		self.dbname = None
 		self.db = None
 		self.nt_timer = None
 	
 	def run_task(self, task):
-		logging.debug('.run_next_task()')
 		self.tasks.append(task)
 		task.run()
 	
@@ -69,21 +72,24 @@ class PgSched:
 		self.tasks.remove(task)
 
 	def cb_got_next_task(self, cur, req):
-		logging.debug('.cb_got_next_task()')
 		row = cur.fetchone()
 		wait = row[0]
 		if wait == None:
-			logging.debug("No more tasks. Waiting.")
-			self.get_next_task_in(5)
+			logging.debug("[%s] No more tasks. Waiting." % self.dbname)
+			self.get_next_task_in(CHECK_PERIOD)
 		elif wait > 0:
-			logging.debug("Waiting %g s for next task." % wait)
+			if wait > CHECK_PERIOD:
+				logging.debug("[%s] Next task in %g s, next check in %g s." % (self.dbname, wait, CHECK_PERIOD))
+				wait = CHECK_PERIOD
+			else:
+				logging.debug("[%s] Waiting %g s for next task." % (self.dbname, wait))
 			self.get_next_task_in(wait)
 		else:
 			self.run_task(Task(row, self.cb_task_finished))
-			self.get_next_task()
+			self.get_next_task_in(0)
 
 	def cb_err_next_task(self, cur, req, err):
-		logging.error("Error retrieving next task: %s" % err)
+		logging.error("[%s] Error retrieving next task: %s" % (self.dbname, err))
 		self.get_next_task_in(1)
 
 	def has_max_conn(self):
@@ -92,22 +98,21 @@ class PgSched:
 
 	# always call this through get_next_task_in()
 	def get_next_task(self, timer = None):
-		logging.debug('.get_next_task()')
 		if timer != None:
 			if timer == self.nt_timer:
 				self.nt_timer = None
 			else:
 				# TODO: temporary bug catcher - remove & shrink this shit to one line
-				logging.warning('BUG: More than one next_task timer active.')
+				logging.warning('BUG: [%s] More than one next_task timer active.' % self.dbname)
 		if self.has_max_conn():
-			logging.debug("Too many connections. Waiting.")
+			logging.debug("[%s] Too many connections. Waiting." % self.dbname)
 			self.get_next_task_in(1)
 		else:
 			self.db.execute('SELECT * FROM "%s".next_task();' % SCHEMA, None, self.cb_got_next_task, self.cb_err_next_task)
 	
 	def get_next_task_in(self, time):
 		if self.nt_timer:
-			logging.debug("Replacing next_task timer.")
+			logging.debug("[%s] Replacing next_task timer." % self.dbname)
 			lbasync.stop_timer(self.nt_timer)
 		if time <= 0:
 			self.nt_timer = None
@@ -116,15 +121,65 @@ class PgSched:
 			self.nt_timer = lbasync.set_timer(self.get_next_task, time)
 	
 	def cb_notify(self, notify, client):
-		logging.debug('NOTIFY received.')
+		logging.debug('[%s] NOTIFY received.' % self.dbname)
 		self.get_next_task_in(0)
 	
+	def cb_check(self, cur, req, error = None):
+		if error == None and cur.fetchone()[0] == 1:
+			self.check_fun(self, True)
+		else:
+			self.check_fun(self, False)
+
+	def connect_and_check(self, check_fun, dbname = None):
+		self.check_fun = check_fun
+		if dbname:
+			self.dbname = dbname
+			environ['PGDATABASE'] = dbname
+		else:
+			self.dbname = environ['PGDATABASE']
+		self.db = PGasync()
+		# TODO: don't wait forever?
+		self.db.execute("SELECT count(nspname) FROM pg_namespace WHERE nspname = '%s'" % SCHEMA, None, self.cb_check, self.cb_check)
+		return False
+
 	def run(self):
-		self.db = PGasync('')
 		self.db.listen('pgs_tasks_change', self.cb_notify)
 		self.get_next_task_in(0)
-		print "---- lbasync.run() ----"
-		lbasync.run()
+	
+	def stop(self):
+		self.db.stop()
+		self.db = None
+
+class PgScheds(list):
+	def __init__(self):
+		self.checking = []
+
+	def cb_check(self, pgs, success):
+		self.checking.remove(pgs) 
+		if success:
+			self.append(pgs)
+			logging.debug('Scheduler connected to DB %s' % pgs.dbname)
+			pgs.run()
+		else:
+			pgs.stop()
+
+	def cb_got_dbs(self, cur, req):
+		for row in cur.fetchall():
+			dbname = row[0]
+			pgs = PgSched()
+			self.checking.append(pgs)
+			pgs.connect_and_check(self.cb_check, dbname)
+
+	def cb_err_dbs(self, cur, req, err):
+		logging.warning('Error retrieving database list: %s' % err)
+		lbasync.exit(1)
+		
+	def start(self, first_db = 'postgres'):
+		environ['PGDATABASE'] = first_db
+		fdb = PGasync()
+		fdb.execute("SELECT datname FROM pg_database WHERE datname NOT LIKE 'template%'", None, self.cb_got_dbs, self.cb_err_dbs) 
+
+		
 
 #### script functions
 
@@ -149,24 +204,21 @@ def load_args():
 		usage()
 		sys.exit(2)
 	for o, a in opts:
-		if o in ('-d', '--daemon'):
-			DAEMON = True
-			# TODO: this does nothing now, use lbasync `export DAEMON` mechanism
-		elif o in ('-h', '--help'):
+		if o in ('-h', '--help'):
 			usage()
 			sys.exit()
 		elif o in ('-v', '--version'):
-			print("pgscheduler version %s" % VERSION)
+			print("pgsched version %s" % VERSION)
 			sys.exit()
 
 def main(daemon = False):
 	load_args()
 	try:
-		pgsched = PgSched()
-		pgsched.run()
+		pgscheds = PgScheds()
+		pgscheds.start()
 	except Exception, e:
 		logging.exception("Unexpected error: " + str(e))
 		sys.exit(1)
 
 if __name__ == "__main__":
-	main()
+	lbasync.run(main)
