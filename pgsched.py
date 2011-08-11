@@ -22,80 +22,107 @@ MAX_CONN = 5
 logger = logging.getLogger()
 
 
-class Task(PGasync):
+TS_WAITING, TS_RUNNING, TS_DONE = range(3)
+class Task:
 	def __init__(self, task_row, finished_callback):
-		PGasync.__init__(self, '')
-		self.type, self.id, self.job, self.role, self.t_run, self.retro = task_row
+		_, self.type, self.id, self.job, self.role, self.t_run, self.retro = task_row
 		self.finished_cb = finished_callback
+		self.db = None
 	
 	def cb_finished(self, cur, req):
-		logger.debug("FINISHED %s task %d." % (self.type, self.id))
-		self.finished_cb(self)
+		self.done()
 
 	def cb_failed(self, cur, req, err):
-		logger.error("Error running %s task %d: %s" % (self.type, self.id, err))
-		self.finished_cb(self, False)
+		self.done(False)
 
 	def done(self, success = True):
-		self.remove()
-		self.close()
+		if success:
+			ss = 'SUCCESS'
+		else:
+			ss = 'FAILURE'
+		logger.debug("Finished %s task %d: %s" % (self.type, self.id, ss))
+		self.db.stop()
+		self.db.close()
+		self.db = None
 		self.finished_cb(self, success)
 
 	def run(self):
 		logger.debug("RUN %s" % self)
-		self.execute('SELECT "%s".next_task();' % SCHEMA, None, self.cb_finished, self.cb_failed)
+		self.db = PGasync('')
+		self.db.execute('SELECT "%s".run_task(\'%s\', %d);' % (SCHEMA, self.type, self.id), None, self.cb_finished, self.cb_failed)
 	
 	def __str__(self):
-		return "%s task %d, job %s with role %s." % (self.type, self.id, self.job, self.role)
-		
-		
+		return "%s task %s, job %s with role %s." % (self.type, self.id, self.job, self.role)
+
+
 class PgSched:
 	def __init__(self):
 		self.tasks = []
-		self.next_task = None
 		self.db = None
+		self.nt_timer = None
 	
-	def run_next_task(self, timer = None):
+	def run_task(self, task):
 		logger.debug('.run_next_task()')
-		self.tasks.append(self.next_task)
-		self.next_task.run()
-		self.next_task = None
-		self.get_next_task()
+		self.tasks.append(task)
+		task.run()
 	
 	def cb_task_finished(self, task, success = True):
-		logger.debug('.cb_task_finished()')
 		self.tasks.remove(task)
 
 	def cb_got_next_task(self, cur, req):
 		logger.debug('.cb_got_next_task()')
 		row = cur.fetchone()
-		if row:
-			self.next_task = Task(row, self.cb_task_finished)
-			t_run = self.next_task.t_run
-			t_now = time.time()
-			if t_run > t_now:
-				lbasync.setTimer(self.run_next_task, t_run - t_now)
-				logger.debug("Scheduled next task: %s %d" % (task[0], task[1]))
-			else:
-				self.run_next_task()
-		else:
+		wait = row[0]
+		if wait == None:
 			logger.debug("No more tasks. Waiting.")
-			lbasync.setTimer(self.run_next_task, 10)
+			self.get_next_task_in(10)
+		elif wait > 0:
+			logger.debug("Waiting %g s for next task." % wait)
+			self.get_next_task_in(wait)
+		else:
+			self.run_task(Task(row, self.cb_task_finished))
+			self.get_next_task()
 
 	def cb_err_next_task(self, cur, req, err):
 		logger.error("Error retrieving next task: %s" % err)
-		lbasync.setTimer(self.get_next_task, 1)
+		self.get_next_task_in(1)
 
+	def has_max_conn(self):
+		l = len([t for t in self.tasks if t.db])
+		return l >= MAX_CONN - 1
+
+	# always call this through get_next_task_in()
 	def get_next_task(self, timer = None):
 		logger.debug('.get_next_task()')
-		if len(self.tasks) >= MAX_CONN - 1:
+		if timer != None:
+			if timer == self.nt_timer:
+				self.nt_timer = None
+			else:
+				# TODO: temporary bug catcher - remove & shrink this shit to one line
+				logger.warning('BUG: More than one next_task timer active.')
+		if self.has_max_conn():
 			logger.debug("Too many connections. Waiting.")
-			lbasync.setTimer(self.get_next_task, 1)
+			self.get_next_task_in(1)
 		else:
 			self.db.execute('SELECT * FROM "%s".next_task();' % SCHEMA, None, self.cb_got_next_task, self.cb_err_next_task)
 	
+	def get_next_task_in(self, time):
+		if self.nt_timer:
+			logger.debug("Replacing next_task timer.")
+			lbasync.stopTimer(self.nt_timer)
+		if time <= 0:
+			self.nt_timer = None
+			self.get_next_task()
+		else:
+			self.nt_timer = lbasync.setTimer(self.get_next_task, time)
+	
+	def cb_notify(self, notify, client):
+		logger.debug('NOTIFY received.')
+		self.get_next_task_in(0)
+	
 	def run(self):
 		self.db = PGasync('')
+		self.db.listen('pgs_tasks_change', self.cb_notify)
 		self.get_next_task()
 		print "---- lbasync.run() ----"
 		lbasync.run()
