@@ -32,16 +32,45 @@ CREATE TABLE pgs_task (
  */
 CREATE TABLE pgs_cron (
 
+	/* cron time as seen in `man 5 crontab` (ranges, steps, names and specials
+	 * are supported) */
+	crontime TEXT NOT NULL DEFAULT '@daily',
     /* run retroactively like anacron? */
     retroactive BOOLEAN DEFAULT FALSE NOT NULL,
 
-    minutes   TEXT NOT NULL DEFAULT '*',
-    hours     TEXT NOT NULL DEFAULT '*',
-    weekdays  TEXT NOT NULL DEFAULT '*',
-    monthdays TEXT NOT NULL DEFAULT '*',
-    months    TEXT NOT NULL DEFAULT '*'
+	/* internal caching */
+    c_min boolean[] NOT NULL DEFAULT '{f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f}'::boolean[],
+    c_hrs boolean[] NOT NULL DEFAULT '{f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f}'::boolean[],
+    c_day boolean[] NOT NULL DEFAULT '{f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f}'::boolean[],
+    c_mon boolean[] NOT NULL DEFAULT '{f,f,f,f,f,f,f,f,f,f,f,f}'::boolean[],
+    c_dow boolean[] NOT NULL DEFAULT '{f,f,f,f,f,f,f}'::boolean[]
 ) 
 INHERITS (pgs_task);
+
+CREATE OR REPLACE FUNCTION cron_change_tr() RETURNS trigger AS $$
+	DECLARE 
+		p parsed_cron_t;
+    BEGIN
+		SELECT INTO p * FROM parse_cron(NEW.crontime);
+		IF p.min IS NULL THEN
+			RAISE EXCEPTION 'Invalid cron time string: %', NEW.crontime;
+			RETURN NULL;
+		END IF;
+		NEW.c_min := p.min;
+		NEW.c_hrs := p.hrs;
+		NEW.c_day := p.day;
+		NEW.c_mon := p.mon;
+		NEW.c_dow := p.dow;
+
+        NOTIFY pgs_tasks_change;
+        RETURN NEW;
+    END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS pgs_cron_change_tr ON pgs_cron;
+CREATE TRIGGER pgs_cron_change_tr
+BEFORE INSERT OR UPDATE ON pgs_cron
+    FOR EACH ROW EXECUTE PROCEDURE cron_change_tr();
 
 
 /*
