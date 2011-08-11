@@ -46,25 +46,30 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION tasks_change_tr() RETURNS trigger AS $$
 	DECLARE
-		check_role BOOLEAN;
+		check_old_role BOOLEAN;
+		check_new_role BOOLEAN;
     BEGIN
-		check_role := FALSE;
-		IF TG_OP = 'UPDATE' THEN
+		check_old_role := TRUE;
+		check_new_role := TRUE;
+
+		IF TG_OP = 'INSERT' THEN
+			check_old_role := FALSE;
+		ELSIF TG_OP = 'UPDATE' THEN
 			IF OLD.id != NEW.id THEN
 				RAISE EXCEPTION 'ID change is forbidden.';
 			END IF;
-			IF OLD.role != NEW.role THEN
-				check_role := TRUE;
+			IF OLD.role = NEW.role THEN
+				check_new_role := FALSE;
 			END IF;
-		ELSE
-			check_role := TRUE;
+		ELSIF TG_OP = 'DELETE' THEN
+			check_new_role := FALSE;
 		END IF;
-
-		RAISE NOTICE '%: %, %', current_user, NEW.role, check_role;
-		IF check_role AND NOT pgscheduler.role_check(current_user, NEW.role) THEN
+		IF check_old_role AND NOT pgscheduler.role_check(current_user, OLD.role) THEN
+			RAISE EXCEPTION 'Current user % can''t modify tasks with role %.', current_user, OLD.role;
+		END IF;
+		IF check_new_role AND NOT pgscheduler.role_check(current_user, NEW.role) THEN
 			RAISE EXCEPTION 'Current user % can''t schedule tasks with role %.', current_user, NEW.role;
 		END IF;
-
         NOTIFY pgs_tasks_change;
 		RETURN NEW;
     END;
@@ -108,7 +113,7 @@ INHERITS (pgs_task);
 
 CREATE OR REPLACE FUNCTION cron_parse_tr() RETURNS trigger AS $$
 	DECLARE 
-		p parsed_cron_t;
+		p pgscheduler.parsed_cron_t;
     BEGIN
 		IF TG_OP = 'UPDATE' AND OLD.crontime = NEW.crontime THEN
 			RETURN NEW;
@@ -129,7 +134,7 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS pgs_cron_change_tr ON pgs_cron;
 CREATE TRIGGER pgs_cron_change_tr
-BEFORE INSERT OR UPDATE ON pgs_cron
+BEFORE INSERT OR UPDATE OR DELETE ON pgs_cron
 	FOR EACH ROW EXECUTE PROCEDURE tasks_change_tr();
 
 DROP TRIGGER IF EXISTS pgs_cron_parse_tr ON pgs_cron;
@@ -150,7 +155,7 @@ INHERITS (pgs_task);
 
 DROP TRIGGER IF EXISTS pgs_at_change_tr ON pgs_at;
 CREATE TRIGGER pgs_at_change_tr
-AFTER INSERT OR UPDATE ON pgs_at
+AFTER INSERT OR UPDATE OR DELETE ON pgs_at
     FOR EACH ROW EXECUTE PROCEDURE tasks_change_tr();
 
 /*
@@ -165,7 +170,7 @@ INHERITS (pgs_task);
 
 DROP TRIGGER IF EXISTS pgs_runner_change_tr ON pgs_runner;
 CREATE TRIGGER pgs_runner_change_tr
-AFTER INSERT OR UPDATE ON pgs_runner
+AFTER INSERT OR UPDATE OR DELETE ON pgs_runner
     FOR EACH ROW EXECUTE PROCEDURE tasks_change_tr();
 
 RESET ROLE;
