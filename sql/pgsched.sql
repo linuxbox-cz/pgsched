@@ -1,9 +1,16 @@
+--
+-- BEWARE: requires hstore from postgresql-contrib installed into public
+--         pgsched role must be prepared
+--
 CREATE SCHEMA pgsched;
 GRANT ALL ON SCHEMA pgsched TO pgsched;
 
 SET ROLE pgsched;
 SET search_path TO pgsched;
 
+CREATE OR REPLACE FUNCTION checked_dbs() RETURNS SETOF TEXT AS $$
+	SELECT datname::TEXT FROM pg_database WHERE datname NOT LIKE 'template%' AND datname != 'postgres';
+$$ LANGUAGE sql;
 
 CREATE OR REPLACE FUNCTION rrcheck(dr OID, rr OID) RETURNS BOOLEAN AS $$
 	DECLARE
@@ -32,13 +39,13 @@ CREATE OR REPLACE FUNCTION role_check(desc_role TEXT, root_role TEXT) RETURNS BO
 		IF dr.oid IS NULL THEN
 			RETURN FALSE;
 		END IF;
-		IF dr.rolsuper THEN
-			RETURN TRUE;
-		END IF;
-
 		SELECT INTO rr oid FROM pg_roles WHERE rolname = root_role;
 		IF rr.oid IS NULL THEN
 			RETURN FALSE;
+		END IF;
+
+		IF dr.rolsuper THEN
+			RETURN TRUE;
 		END IF;
 
 		RETURN pgsched.rrcheck(dr.oid, rr.oid);
@@ -82,7 +89,6 @@ $$ LANGUAGE plpgsql;
  */
 CREATE TABLE pgs_task (
     id          SERIAL PRIMARY KEY,
-	/* function name to call (without parenthesis) */
     job         TEXT NOT NULL,
     created     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_run    TIMESTAMPTZ,
@@ -90,17 +96,17 @@ CREATE TABLE pgs_task (
     role        TEXT NOT NULL,
     enabled     BOOLEAN NOT NULL DEFAULT TRUE,
     valid_from  TIMESTAMPTZ,
-    valid_to    TIMESTAMPTZ
+    valid_to    TIMESTAMPTZ,
+	log_level   INTEGER NOT NULL DEFAULT 1
 );
+COMMENT ON COLUMN pgs_task.job IS 'Name of function to call without ().';
+COMMENT ON COLUMN pgs_task.log_level IS '0 - log nothing, 1 - log fails only, 2 - log errors, runs & finishes';
+
 /*
  * Periodic cron style tasks.
  */
 CREATE TABLE pgs_cron (
-
-	/* cron time as seen in `man 5 crontab` (ranges, steps, names and specials
-	 * are supported) */
 	crontime TEXT NOT NULL DEFAULT '@daily',
-    /* run retroactively like anacron? */
     retroactive BOOLEAN DEFAULT FALSE NOT NULL,
 
 	/* internal caching */
@@ -111,6 +117,18 @@ CREATE TABLE pgs_cron (
     c_dow boolean[] NOT NULL DEFAULT '{f,f,f,f,f,f,f}'::boolean[]
 ) 
 INHERITS (pgs_task);
+COMMENT ON COLUMN pgs_cron.crontime IS 'Cron time as seen in `man 5 crontab` (ranges, steps, names and specials are supported). c_* columns are internal, ignore them.';
+COMMENT ON COLUMN pgs_cron.retroactive IS 'Run retroactively like anacron?.';
+
+DROP TYPE IF EXISTS parsed_cron_t CASCADE;
+CREATE TYPE parsed_cron_t AS
+(
+    min boolean[],
+    hrs boolean[],
+    day boolean[],
+    mon boolean[],
+    dow boolean[]
+);
 
 CREATE OR REPLACE FUNCTION cron_parse_tr() RETURNS trigger AS $$
 	DECLARE 
@@ -149,10 +167,10 @@ BEFORE INSERT OR UPDATE ON pgs_cron
  */
 CREATE TABLE pgs_at (
     run_at timestamptz NOT NULL,
-    /* run retroactively (when daemon was down at the time etc.)? */
     retroactive boolean DEFAULT false NOT NULL
 ) 
 INHERITS (pgs_task);
+COMMENT ON COLUMN pgs_at.retroactive IS 'Run retroactively? (when daemon was down at the time etc.)';
 
 DROP TRIGGER IF EXISTS pgs_at_change_tr ON pgs_at;
 CREATE TRIGGER pgs_at_change_tr
@@ -168,14 +186,31 @@ CREATE TABLE pgs_runner (
     last_finished    TIMESTAMPTZ
 ) 
 INHERITS (pgs_task);
+COMMENT ON COLUMN pgs_runner.period IS 'How long after the task finished shall we run it again?';
 
 DROP TRIGGER IF EXISTS pgs_runner_change_tr ON pgs_runner;
 CREATE TRIGGER pgs_runner_change_tr
 AFTER INSERT OR UPDATE OR DELETE ON pgs_runner
     FOR EACH ROW EXECUTE PROCEDURE tasks_change_tr();
 
+/*
+ * Logging
+ */
+CREATE TABLE pgs_log (
+    t timestamptz NOT NULL DEFAULT clock_timestamp(),
+    type CHAR(5) NOT NULL,
+    args public.hstore
+);
 
 /*-*-*-*-*-*-*-*-*-*-* FUNCTIONS *-*-*-*-*-*-*-*-*-*-*/
+
+CREATE OR REPLACE FUNCTION log(l_type CHAR(5), l_args public.hstore) RETURNS VOID AS $$
+    BEGIN
+		INSERT INTO pgsched.pgs_log (type, args) VALUES(l_type, l_args);
+	END;
+$$ LANGUAGE plpgsql;
+
+
 
 DROP TYPE IF EXISTS task_t CASCADE;
 CREATE TYPE task_t AS
@@ -199,7 +234,6 @@ CREATE OR REPLACE FUNCTION next_task() RETURNS task_t AS $$
 		t          TIMESTAMPTZ;
 		BEGIN
 		SET search_path TO pgsched;
-		/* TODO: if task.run_at == now() don't check further tables (AT first?) */
 
 		/* AT */
 		LOOP
@@ -208,8 +242,6 @@ CREATE OR REPLACE FUNCTION next_task() RETURNS task_t AS $$
 				ORDER BY run_at ASC LIMIT 1;
 			/* purge missed not retroactive tasks if encountered one */
 			IF nat.run_at IS NOT NULL AND NOT nat.retroactive AND nat.run_at < now() - '5 minutes'::interval THEN 
-				/* DEBUG: remove in furure */
-				RAISE NOTICE 'Purging missed not retroactive tasks.';
 				DELETE FROM pgs_at WHERE enabled IS TRUE AND last_run IS NULL AND run_at < now() - '5 minutes'::interval;
 			ELSE
 				SELECT INTO task 0, 'at', nat.id, nat.job, nat.role, nat.run_at, nat.retroactive;   
@@ -257,13 +289,13 @@ CREATE OR REPLACE FUNCTION next_task() RETURNS task_t AS $$
 $$ LANGUAGE plpgsql;
 
 
-CREATE OR REPLACE FUNCTION run_as(fun TEXT, role TEXT, proxyf TEXT) RETURNS INTEGER AS $$
+CREATE OR REPLACE FUNCTION run_as(fun TEXT, role TEXT, log_level INTEGER, proxyf TEXT) RETURNS INTEGER AS $$
 	DECLARE
 		useless RECORD;
+		errm    TEXT;
     BEGIN
-		RAISE NOTICE 'Proxy function: %()', proxyf ;
 		EXECUTE 'CREATE OR REPLACE FUNCTION ' || proxyf || '() RETURNS VOID AS ''
-			BEGIN PERFORM ' || fun || '()::VOID; END
+			BEGIN PERFORM ' || fun || '(); END
 			'' LANGUAGE plpgsql SECURITY DEFINER;
 			ALTER FUNCTION ' || proxyf || '() OWNER TO ' || role;
 		EXECUTE 'SET SESSION AUTHORIZATION ' || role;
@@ -272,17 +304,13 @@ CREATE OR REPLACE FUNCTION run_as(fun TEXT, role TEXT, proxyf TEXT) RETURNS INTE
 		RESET SESSION AUTHORIZATION;
 		RETURN 0;
 	EXCEPTION
-		WHEN undefined_function THEN
-			RAISE WARNING 'UNDEFINED FUNCTION: maybe %() is not defined?', fun;
-			RETURN -1;
-		WHEN undefined_object THEN
-			RAISE WARNING 'UNDEFINED OBJECT: maybe ''%'' is invalid role?', role;
-			RETURN -2;
-		WHEN insufficient_privilege THEN
-			RAISE WARNING 'INSUFFICIENT PRIVILEGE: maybe role ''%'' doesn''t have privilege to call %() ?', role, fun;
-			RETURN -3;
 		WHEN others THEN
-			return -42;
+			IF log_level >= 1 THEN
+				errm := quote_literal(SQLERRM);
+				PERFORM pgsched.log('err', public.hs_concat(('fun=>run_as,job=>' || fun ||',role=>' || role
+					|| ', errcode=>' || SQLSTATE)::public.hstore, public.hstore('msg', SQLERRM)));
+			END IF;
+			RETURN -1;
 	END;
 $$ LANGUAGE plpgsql;
 
@@ -291,18 +319,32 @@ CREATE OR REPLACE FUNCTION run_task(task_type TEXT, task_id INTEGER) RETURNS INT
 		task   RECORD;
 		r      INTEGER;
     BEGIN
-		EXECUTE 'SELECT job, role FROM pgsched.pgs_' || task_type || ' WHERE id = ' || task_id INTO task;
+		EXECUTE 'SELECT job, role, log_level FROM pgsched.pgs_' || task_type || ' WHERE id = ' || task_id INTO task;
 		IF task.job IS NULL THEN
-			RAISE WARNING '% task % to run not found in pgs_runner. Ignoring.', task_type, task_id;
-			RETURN -4;
+			PERFORM pgsched.log('warn', ('fun=>run_task,task_type=>' || task_type ||',task_id=>' || task_id
+				|| ',msg=>"Task to run not found. Ignoring.'
+				|| ' (Multiple instances? Manual run_task() invocation? Bug?)"')::public.hstore);
+			RETURN -2;
+		END IF;
+		IF task.log_level >= 2 THEN
+			PERFORM pgsched.log('run', ('task_type=>' || task_type ||',task_id=>' || task_id
+				|| ',job=>' || task.job || ',role=>' || task.role)::public.hstore);
 		END IF;
 
-		r := run_as(task.job, task.role, 'pgs_proxy_tmp');
-
+		r := run_as(task.job, task.role, task.log_level, 'pgs_proxy_tmp');
 		IF task_type = 'runner' THEN
 			UPDATE pgsched.pgs_runner SET last_finished = clock_timestamp() WHERE id = task_id ;
 		END IF;
-			
+		-- TODO: what about failed retroactive AT tasks? Delete? Purge once in a while?
+		IF task_type = 'at' AND r = 0 THEN
+			DELETE FROM pgsched.pgs_at WHERE id = task_id ;
+		END IF;
+
+		IF task.log_level >= 2 THEN
+			PERFORM pgsched.log('fin', ('task_type=>' || task_type ||',task_id=>' || task_id
+				|| ',job=>' || task.job || ',role=>' || task.role
+				|| ',result=>' || r)::public.hstore);
+		END IF;
 		RETURN r;
 	END
 $$ LANGUAGE plpgsql;
@@ -426,16 +468,6 @@ AS $$
 	END
 $$ LANGUAGE plpgsql;
 
-
-DROP TYPE IF EXISTS parsed_cron_t CASCADE;
-CREATE TYPE parsed_cron_t AS
-(
-    min boolean[],
-    hrs boolean[],
-    day boolean[],
-    mon boolean[],
-    dow boolean[]
-);
 
 CREATE LANGUAGE plpythonu;
 CREATE OR REPLACE FUNCTION parse_cron (cron_time TEXT) RETURNS parsed_cron_t
@@ -566,4 +598,10 @@ AS $$
 	return c.get_parsed_fields(cron_time)
 $$ LANGUAGE plpythonu;
 
+-- debug function
+CREATE OR REPLACE FUNCTION test_log() RETURNS VOID AS $$
+	SELECT pgsched.log('test', 'fun=>test_log');
+$$ LANGUAGE sql;
+
 RESET ROLE;
+

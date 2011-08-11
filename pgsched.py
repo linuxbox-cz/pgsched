@@ -21,6 +21,7 @@ DEBUG = True
 DAEMON = False
 MAX_CONN = 5
 CHECK_PERIOD = 30
+DB_SEEK_TIMEOUT = 30
 
 
 TS_WAITING, TS_RUNNING, TS_DONE = range(3)
@@ -48,13 +49,14 @@ class Task:
 		self.finished_cb(self, success)
 
 	def run(self):
-		logging.debug("RUN %s" % self)
+		logging.debug("[%s] RUN %s" % (self.dbname, self))
 		environ['PGDATABASE'] = self.dbname
-		self.db = PGasync()
-		self.db.execute('SELECT "%s".run_task(\'%s\', %d);' % (SCHEMA, self.type, self.id), None, self.cb_finished, self.cb_failed)
+
+		self.db = PGasync(name='[%s] %s task %s' % (self.dbname, self.type, self.id))
+		self.db.execute('SELECT "%s".run_task(%%s, %%s);' % SCHEMA, (self.type, self.id), self.cb_finished, self.cb_failed)
 	
 	def __str__(self):
-		return "[%s] %s task %s, job %s with role %s." % (self.dbname, self.type, self.id, self.job, self.role)
+		return "%s task %s, job %s with role %s." % (self.type, self.id, self.job, self.role)
 
 
 class PgSched:
@@ -85,7 +87,7 @@ class PgSched:
 				logging.debug("[%s] Waiting %g s for next task." % (self.dbname, wait))
 			self.get_next_task_in(wait)
 		else:
-			self.run_task(Task(row, self.cb_task_finished))
+			self.run_task(Task(self.dbname, row, self.cb_task_finished))
 			self.get_next_task_in(0)
 
 	def cb_err_next_task(self, cur, req, err):
@@ -137,7 +139,7 @@ class PgSched:
 			environ['PGDATABASE'] = dbname
 		else:
 			self.dbname = environ['PGDATABASE']
-		self.db = PGasync()
+		self.db = PGasync(name=self.dbname)
 		# TODO: don't wait forever?
 		self.db.execute("SELECT count(nspname) FROM pg_namespace WHERE nspname = '%s'" % SCHEMA, None, self.cb_check, self.cb_check)
 		return False
@@ -150,9 +152,10 @@ class PgSched:
 		self.db.stop()
 		self.db = None
 
-class PgScheds(list):
+class PgSchedSeeker(list):
 	def __init__(self):
 		self.checking = []
+		self.db = None
 
 	def cb_check(self, pgs, success):
 		self.checking.remove(pgs) 
@@ -164,20 +167,28 @@ class PgScheds(list):
 			pgs.stop()
 
 	def cb_got_dbs(self, cur, req):
-		for row in cur.fetchall():
+		rows = cur.fetchall()
+		self.db.stop()
+		for row in rows:
 			dbname = row[0]
 			pgs = PgSched()
 			self.checking.append(pgs)
 			pgs.connect_and_check(self.cb_check, dbname)
+		lbasync.set_timer(self.check_timeout, DB_SEEK_TIMEOUT)
+	
+	def check_timeout(self, timer = None):
+		logging.debug("DB seek timed out. Killing %d connections." % len(self.checking))
+		# TODO: stop all self.checking
+		pass
 
 	def cb_err_dbs(self, cur, req, err):
 		logging.warning('Error retrieving database list: %s' % err)
 		lbasync.exit(1)
-		
+	
 	def start(self, first_db = 'postgres'):
 		environ['PGDATABASE'] = first_db
-		fdb = PGasync()
-		fdb.execute("SELECT datname FROM pg_database WHERE datname NOT LIKE 'template%'", None, self.cb_got_dbs, self.cb_err_dbs) 
+		self.db = PGasync(name='DB seeker @ %s' % first_db)
+		self.db.execute("SELECT datname::TEXT FROM pg_database WHERE datname NOT LIKE 'template%' AND datname != 'postgres'", None, self.cb_got_dbs, self.cb_err_dbs) 
 
 		
 
@@ -214,7 +225,7 @@ def load_args():
 def main(daemon = False):
 	load_args()
 	try:
-		pgscheds = PgScheds()
+		pgscheds = PgSchedSeeker()
 		pgscheds.start()
 	except Exception, e:
 		logging.exception("Unexpected error: " + str(e))
