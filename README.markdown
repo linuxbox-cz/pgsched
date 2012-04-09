@@ -4,8 +4,15 @@
                / ___/ (_ / (_-</ __/ _ \/ -_) _  / // / / -_) __/
               /_/   \___/ /___/\__/_//_/\__/\_,_/\_,_/_/\__/_/
 
+ABOUT
+-----
+
 PG scheduler alias `pgsched` is a minimal python daemon providing cron/at/init
-functionality at a PostgreSQL server. `pgsched` is developed by LinuxBox.cz.
+functionality at a PostgreSQL server.
+
+`pgsched` is developed by Jakub Ružička for LinuxBox.cz under Modified BSD
+License (see COPYING).
+
 
 HOW IT WORKS
 ------------
