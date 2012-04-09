@@ -5,16 +5,16 @@
               /_/   \___/ /___/\__/_//_/\__/\_,_/\_,_/_/\__/_/
 
 PG scheduler alias `pgsched` is a minimal python daemon providing cron/at/init
-functionality at a PostgreSQL server developed by LinuxBox.cz.
+functionality at a PostgreSQL server. `pgsched` is developed by LinuxBox.cz.
 
 HOW IT WORKS
 ------------
  * `pgsched` daemon connects to PostgreSQL server and looks for all databases
 	containing `pgsched` schema.
  * `pgsched` schema contains (among other thing) 3 tables:
-	* pgs_cron:   periodic tasks with cron scheduling
-	* pgs_at:     one-time tasks ran at specific time
-	* pgs_runner: continuous tasks
+	* `pgs_cron`:   periodic tasks with cron scheduling
+	* `pgs_at`:     one-time tasks ran at specific time
+	* `pgs_runner`: continuous tasks
 
 	By INSERTing into these tables, tasks are scheduled and later run by
 	pgsched.
