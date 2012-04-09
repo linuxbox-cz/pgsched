@@ -5,7 +5,7 @@ all: dist
 
 dist:
 	mkdir -p $(DDIR)/sql
-	ln pgsched.py init-script README $(DDIR)
+	ln pgsched.py init-script README.markdown $(DDIR)
 	ln sql/pgsched.sql sql/uninstall_pgsched.sql $(DDIR)/sql
 	tar -czf $(DDIR).tgz $(DDIR)
 	rm -rf $(DDIR)
